@@ -1,19 +1,91 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Load user config
+# Resolve the directory where this script lives (follows symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
 CONFIG_FILE="${HOME}/.wf-workspace.conf"
+
+# --- First-run setup ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "Error: Config file not found: $CONFIG_FILE"
+  echo "Welcome to wf-workspace! Let's set things up."
   echo ""
-  echo "Create it with:"
-  echo "  cat > $CONFIG_FILE << 'EOF'"
-  echo '  MAIN_REPO="$HOME/code/wefunder"'
-  echo '  WORKTREE_BASE="$HOME/code/worktrees"'
-  echo '  BRANCH_PREFIX="yourname"'
-  echo "  EOF"
-  exit 1
+
+  # Detect main repo path
+  default_repo=""
+  for candidate in "$HOME/code/wefunder" "$HOME/wefunder"; do
+    if [[ -d "$candidate/.git" ]]; then
+      default_repo="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$default_repo" ]]; then
+    read -rp "Main wefunder repo path [$default_repo]: " input_repo
+    input_repo="${input_repo:-$default_repo}"
+  else
+    read -rp "Main wefunder repo path: " input_repo
+  fi
+
+  if [[ ! -d "$input_repo/.git" ]]; then
+    echo "Error: $input_repo doesn't look like a git repo"
+    exit 1
+  fi
+
+  # Worktree base defaults to sibling of main repo
+  default_worktrees="$(dirname "$input_repo")/worktrees"
+  read -rp "Worktree base directory [$default_worktrees]: " input_worktrees
+  input_worktrees="${input_worktrees:-$default_worktrees}"
+
+  # Branch prefix from git config or username
+  default_prefix="$(git config user.name 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ' ' '-' || true)"
+  if [[ -z "$default_prefix" ]]; then
+    default_prefix="$(whoami)"
+  fi
+  read -rp "Branch prefix (your name) [$default_prefix]: " input_prefix
+  input_prefix="${input_prefix:-$default_prefix}"
+
+  cat > "$CONFIG_FILE" << EOF
+# wf-workspace configuration
+MAIN_REPO="$input_repo"
+WORKTREE_BASE="$input_worktrees"
+BRANCH_PREFIX="$input_prefix"
+EOF
+
+  echo ""
+  echo "Config saved to $CONFIG_FILE"
+
+  # Offer to symlink into ~/bin
+  script_path="$(readlink -f "$0")"
+  monitor_path="$SCRIPT_DIR/wf-workspace-monitor"
+  bin_link="$HOME/bin/wf-workspace"
+
+  if [[ "$script_path" != "$bin_link" && "$(readlink -f "$bin_link" 2>/dev/null)" != "$script_path" ]]; then
+    echo ""
+    read -rp "Symlink scripts into ~/bin for easy access? [Y/n]: " symlink_choice
+    symlink_choice="${symlink_choice:-y}"
+    if [[ "$symlink_choice" =~ ^[Yy] ]]; then
+      mkdir -p "$HOME/bin"
+      ln -sf "$script_path" "$HOME/bin/wf-workspace"
+      if [[ -f "$monitor_path" ]]; then
+        ln -sf "$monitor_path" "$HOME/bin/wf-workspace-monitor"
+      fi
+      echo "Symlinked into ~/bin/"
+
+      # Check if ~/bin is in PATH
+      if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+        echo ""
+        echo "Note: ~/bin is not in your PATH. Add this to your shell profile:"
+        echo '  export PATH="$HOME/bin:$PATH"'
+      fi
+    fi
+  fi
+
+  echo ""
+  echo "Setup complete! Re-run your command to get started."
+  exit 0
 fi
+
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
@@ -53,7 +125,6 @@ usage() {
   echo "Examples:"
   echo "  wf-workspace fix-login        # New tab: ${BRANCH_PREFIX}/fix-login"
   echo "  wf-workspace                  # New tab: ${BRANCH_PREFIX}/workspace-<timestamp>"
-  echo "  wf-workspace master           # New tab for main repo (no worktree)"
   echo "  wf-workspace -e fix-login     # Tab for existing worktree"
   echo "  wf-workspace close fix-login  # Stop server, remove worktree, close tmux tab"
   echo "  wf-workspace close            # Close current tmux tab/worktree"
@@ -93,20 +164,6 @@ close_workspace() {
     echo "Error: Could not infer workspace name."
     echo "Run: wf-workspace close <name>"
     exit 1
-  fi
-
-  # Master tab has no worktree to clean up
-  if [[ "$name" == "master" ]]; then
-    echo "Closing master tab..."
-    if tmux has-session -t "$SESSION" 2>/dev/null; then
-      if tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "master"; then
-        tmux kill-window -t "$SESSION:master" 2>/dev/null || true
-        echo "✓ Closed tmux tab: master"
-      else
-        echo "ℹ️  No tmux tab named 'master' in session '$SESSION'"
-      fi
-    fi
-    return 0
   fi
 
   local worktree_dir="$WORKTREE_BASE/$name"
@@ -261,78 +318,10 @@ if [[ -z "$NAME" ]]; then
   NAME="workspace-$(date +%m%d-%H%M)"
 fi
 
-# --- Master mode: open a tab pointing at the main repo ---
-if [[ "$NAME" == "master" ]]; then
-  WORK_DIR="$MAIN_REPO"
-
-  SESSION_EXISTS=false
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    SESSION_EXISTS=true
-  fi
-
-  if [[ "$SESSION_EXISTS" == true ]] && tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "master"; then
-    echo "Tab 'master' already exists. Switching to it..."
-    tmux select-window -t "$SESSION:master"
-    exec tmux attach -t "$SESSION"
-  fi
-
-  echo ""
-  read -rp "Which CLI do you want to open? ([claude]/agent): " CLI_CHOICE
-  CLI_CHOICE="${CLI_CHOICE:-claude}"
-
-  if [[ "$CLI_CHOICE" == "agent" ]]; then
-    CLI_CMD="agent"
-    CLI_LABEL="agent (Cursor)"
-  else
-    CLI_CMD="claude"
-    CLI_LABEL="claude"
-  fi
-
-  echo ""
-  echo "  Tab: master"
-  echo "  Directory: $WORK_DIR"
-  echo "  Left:         $CLI_LABEL (70%)"
-  echo "  Top-right:    tig status (30%)"
-  echo "  Bottom-right: dev server (30%)"
-  echo ""
-
-  setup_master_panes() {
-    local target="$1"
-
-    tmux split-window -h -t "$target" -c "$WORK_DIR" \
-      "while true; do tig status; sleep 0.2; done"
-
-    tmux split-window -v -t "${target}.1" -c "$WORK_DIR" \
-      "bin/dev; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
-
-    tmux resize-pane -t "${target}.0" -x "70%"
-  }
-
-  if [[ "$SESSION_EXISTS" == true ]]; then
-    tmux new-window -t "$SESSION" -n "master" -c "$WORK_DIR" \
-      "$CLI_CMD; echo 'Press Enter to close pane.'; read"
-
-    setup_master_panes "$SESSION:master"
-    tmux select-window -t "$SESSION:master"
-  else
-    tmux new-session -d -s "$SESSION" -n "master" -c "$WORK_DIR" \
-      "$CLI_CMD; echo 'Press Enter to close pane.'; read"
-
-    setup_master_panes "$SESSION:master"
-  fi
-
-  if ! pgrep -f "wf-workspace-monitor" > /dev/null 2>&1; then
-    nohup ~/bin/wf-workspace-monitor > /dev/null 2>&1 &
-    disown
-  fi
-
-  exec tmux attach -t "$SESSION"
-fi
-
-# --- Worktree mode ---
 BRANCH="${BRANCH_PREFIX}/$NAME"
 WORKTREE_DIR="$WORKTREE_BASE/$NAME"
 
+# --- Worktree setup ---
 if [[ "$EXISTING" == true ]]; then
   if [[ ! -d "$WORKTREE_DIR" ]]; then
     echo "Error: Worktree not found at $WORKTREE_DIR"
