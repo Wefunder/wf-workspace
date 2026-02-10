@@ -1,11 +1,24 @@
 # wf-workspace configuration
-# Copy this to ~/.wf-workspace.conf and edit for your setup.
+#
+# Config lives in ~/.config/wf-workspace/
+#
+# Global config: ~/.config/wf-workspace/config
+# Projects:      ~/.config/wf-workspace/projects/<name>
+#
+# Run `wf-workspace` for the first time to set up interactively,
+# or `wf-workspace setup <project-name>` to add a project.
 
-# Path to the main wefunder repo
-MAIN_REPO="$HOME/code/wefunder"
+# --- ~/.config/wf-workspace/config ---
+# BRANCH_PREFIX="yourname"
+# DEFAULT_PROJECT="wefunder"
 
-# Where worktrees are created
-WORKTREE_BASE="$HOME/code/worktrees"
+# --- ~/.config/wf-workspace/projects/wefunder ---
+# REPO="/path/to/wefunder"
+# SESSION="wefunder"
+# WORKTREE_BASE="/path/to/worktrees"    # optional: omit for direct repo tabs
+# DEV_CMD="bin/dev-worktree start"      # optional: omit for no dev server pane
 
-# Branch prefix (your name)
-BRANCH_PREFIX="yourname"
+# --- ~/.config/wf-workspace/projects/wf-workspace ---
+# REPO="/path/to/wf-workspace"
+# SESSION="wf-workspace"
+# (no WORKTREE_BASE or DEV_CMD = simple claude + tig layout)

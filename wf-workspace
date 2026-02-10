@@ -4,38 +4,13 @@ set -euo pipefail
 # Resolve the directory where this script lives (follows symlinks)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
-CONFIG_FILE="${HOME}/.wf-workspace.conf"
+CONFIG_DIR="${HOME}/.config/wf-workspace"
+PROJECTS_DIR="$CONFIG_DIR/projects"
 
 # --- First-run setup ---
-if [[ ! -f "$CONFIG_FILE" ]]; then
+if [[ ! -d "$CONFIG_DIR" ]]; then
   echo "Welcome to wf-workspace! Let's set things up."
   echo ""
-
-  # Detect main repo path
-  default_repo=""
-  for candidate in "$HOME/code/wefunder" "$HOME/wefunder"; do
-    if [[ -d "$candidate/.git" ]]; then
-      default_repo="$candidate"
-      break
-    fi
-  done
-
-  if [[ -n "$default_repo" ]]; then
-    read -rp "Main wefunder repo path [$default_repo]: " input_repo
-    input_repo="${input_repo:-$default_repo}"
-  else
-    read -rp "Main wefunder repo path: " input_repo
-  fi
-
-  if [[ ! -d "$input_repo/.git" ]]; then
-    echo "Error: $input_repo doesn't look like a git repo"
-    exit 1
-  fi
-
-  # Worktree base defaults to sibling of main repo
-  default_worktrees="$(dirname "$input_repo")/worktrees"
-  read -rp "Worktree base directory [$default_worktrees]: " input_worktrees
-  input_worktrees="${input_worktrees:-$default_worktrees}"
 
   # Branch prefix from git config or username
   default_prefix="$(git config user.name 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ' ' '-' || true)"
@@ -45,15 +20,63 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   read -rp "Branch prefix (your name) [$default_prefix]: " input_prefix
   input_prefix="${input_prefix:-$default_prefix}"
 
-  cat > "$CONFIG_FILE" << EOF
-# wf-workspace configuration
-MAIN_REPO="$input_repo"
-WORKTREE_BASE="$input_worktrees"
+  mkdir -p "$PROJECTS_DIR"
+  cat > "$CONFIG_DIR/config" << EOF
 BRANCH_PREFIX="$input_prefix"
 EOF
 
   echo ""
-  echo "Config saved to $CONFIG_FILE"
+  echo "Setting up your first project..."
+  echo ""
+
+  # Detect wefunder repo
+  default_repo=""
+  for candidate in "$HOME/code/wefunder" "$HOME/wefunder"; do
+    if [[ -d "$candidate/.git" ]]; then
+      default_repo="$candidate"
+      break
+    fi
+  done
+
+  read -rp "Project name [wefunder]: " proj_name
+  proj_name="${proj_name:-wefunder}"
+
+  if [[ -n "$default_repo" ]]; then
+    read -rp "Repo path [$default_repo]: " input_repo
+    input_repo="${input_repo:-$default_repo}"
+  else
+    read -rp "Repo path: " input_repo
+  fi
+
+  if [[ ! -d "$input_repo/.git" ]]; then
+    echo "Error: $input_repo doesn't look like a git repo"
+    exit 1
+  fi
+
+  read -rp "tmux session name [$proj_name]: " input_session
+  input_session="${input_session:-$proj_name}"
+
+  default_worktrees="$(dirname "$input_repo")/worktrees"
+  read -rp "Worktree base directory (leave empty to skip worktrees) [$default_worktrees]: " input_worktrees
+  input_worktrees="${input_worktrees:-$default_worktrees}"
+
+  read -rp "Dev server command (leave empty for none) [bin/dev-worktree start]: " input_dev
+  input_dev="${input_dev:-bin/dev-worktree start}"
+
+  {
+    echo "REPO=\"$input_repo\""
+    echo "SESSION=\"$input_session\""
+    [[ -n "$input_worktrees" ]] && echo "WORKTREE_BASE=\"$input_worktrees\""
+    [[ -n "$input_dev" ]] && echo "DEV_CMD=\"$input_dev\""
+  } > "$PROJECTS_DIR/$proj_name"
+
+  # Set as default project
+  echo "DEFAULT_PROJECT=\"$proj_name\"" >> "$CONFIG_DIR/config"
+
+  echo ""
+  echo "Config saved to $CONFIG_DIR/"
+  echo "  Global:  $CONFIG_DIR/config"
+  echo "  Project: $PROJECTS_DIR/$proj_name"
 
   # Offer to symlink into ~/bin
   script_path="$(readlink -f "$0")"
@@ -72,7 +95,6 @@ EOF
       fi
       echo "Symlinked into ~/bin/"
 
-      # Check if ~/bin is in PATH
       if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
         echo ""
         echo "Note: ~/bin is not in your PATH. Add this to your shell profile:"
@@ -83,39 +105,188 @@ EOF
 
   echo ""
   echo "Setup complete! Re-run your command to get started."
+  echo "Add more projects with: wf-workspace setup <name>"
   exit 0
 fi
 
-# shellcheck source=/dev/null
-source "$CONFIG_FILE"
+# --- Migrate old config format ---
+if [[ -f "${HOME}/.wf-workspace.conf" && ! -f "$CONFIG_DIR/migrated" ]]; then
+  echo "Migrating old config from ~/.wf-workspace.conf..."
+  # shellcheck source=/dev/null
+  source "${HOME}/.wf-workspace.conf"
+  mkdir -p "$PROJECTS_DIR"
 
-# Validate required config
-for var in MAIN_REPO WORKTREE_BASE BRANCH_PREFIX; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "Error: $var not set in $CONFIG_FILE"
+  if [[ ! -f "$CONFIG_DIR/config" ]]; then
+    cat > "$CONFIG_DIR/config" << EOF
+BRANCH_PREFIX="${BRANCH_PREFIX:-}"
+DEFAULT_PROJECT="wefunder"
+EOF
+  fi
+
+  if [[ ! -f "$PROJECTS_DIR/wefunder" ]]; then
+    {
+      echo "REPO=\"${MAIN_REPO:-}\""
+      echo "SESSION=\"wefunder\""
+      [[ -n "${WORKTREE_BASE:-}" ]] && echo "WORKTREE_BASE=\"$WORKTREE_BASE\""
+      echo "DEV_CMD=\"bin/dev-worktree start\""
+    } > "$PROJECTS_DIR/wefunder"
+  fi
+
+  touch "$CONFIG_DIR/migrated"
+  echo "Done. Config now lives in $CONFIG_DIR/"
+  echo ""
+fi
+
+# --- Load global config ---
+# shellcheck source=/dev/null
+source "$CONFIG_DIR/config"
+
+if [[ -z "${BRANCH_PREFIX:-}" ]]; then
+  echo "Error: BRANCH_PREFIX not set in $CONFIG_DIR/config"
+  exit 1
+fi
+
+# --- Detect project ---
+detect_project_from_cwd() {
+  for proj_file in "$PROJECTS_DIR"/*; do
+    [[ -f "$proj_file" ]] || continue
+    local proj_repo=""
+    proj_repo="$(grep '^REPO=' "$proj_file" | head -1 | cut -d'"' -f2)"
+    if [[ -n "$proj_repo" && "$PWD" == "$proj_repo"* ]]; then
+      basename "$proj_file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+load_project() {
+  local proj_name="$1"
+  local proj_file="$PROJECTS_DIR/$proj_name"
+
+  if [[ ! -f "$proj_file" ]]; then
+    echo "Error: Unknown project '$proj_name'"
+    echo ""
+    echo "Available projects:"
+    ls "$PROJECTS_DIR" 2>/dev/null || echo "  (none)"
+    echo ""
+    echo "Add one with: wf-workspace setup $proj_name"
     exit 1
   fi
-done
 
-SESSION="wefunder"
+  # Reset optional vars
+  REPO=""
+  SESSION=""
+  WORKTREE_BASE=""
+  DEV_CMD=""
 
+  # shellcheck source=/dev/null
+  source "$proj_file"
+
+  if [[ -z "$REPO" ]]; then
+    echo "Error: REPO not set in $proj_file"
+    exit 1
+  fi
+  if [[ -z "$SESSION" ]]; then
+    SESSION="$proj_name"
+  fi
+}
+
+# --- Setup subcommand ---
+run_setup() {
+  local proj_name="${1:-}"
+  if [[ -z "$proj_name" ]]; then
+    read -rp "Project name: " proj_name
+  fi
+
+  if [[ -z "$proj_name" ]]; then
+    echo "Error: Project name required"
+    exit 1
+  fi
+
+  local proj_file="$PROJECTS_DIR/$proj_name"
+  mkdir -p "$PROJECTS_DIR"
+
+  # Pre-fill defaults if editing existing
+  local existing_repo="" existing_session="" existing_worktrees="" existing_dev=""
+  if [[ -f "$proj_file" ]]; then
+    echo "Updating project: $proj_name"
+    # shellcheck source=/dev/null
+    source "$proj_file"
+    existing_repo="$REPO"
+    existing_session="$SESSION"
+    existing_worktrees="${WORKTREE_BASE:-}"
+    existing_dev="${DEV_CMD:-}"
+  else
+    echo "New project: $proj_name"
+  fi
+
+  local default_repo="${existing_repo:-}"
+  if [[ -n "$default_repo" ]]; then
+    read -rp "Repo path [$default_repo]: " input_repo
+    input_repo="${input_repo:-$default_repo}"
+  else
+    read -rp "Repo path: " input_repo
+  fi
+
+  if [[ ! -d "$input_repo/.git" ]]; then
+    echo "Error: $input_repo doesn't look like a git repo"
+    exit 1
+  fi
+
+  local default_session="${existing_session:-$proj_name}"
+  read -rp "tmux session name [$default_session]: " input_session
+  input_session="${input_session:-$default_session}"
+
+  local default_worktrees="${existing_worktrees:-}"
+  if [[ -z "$default_worktrees" ]]; then
+    read -rp "Worktree base directory (leave empty to skip worktrees): " input_worktrees
+  else
+    read -rp "Worktree base directory (leave empty to skip) [$default_worktrees]: " input_worktrees
+    input_worktrees="${input_worktrees:-$default_worktrees}"
+  fi
+
+  local default_dev="${existing_dev:-}"
+  if [[ -z "$default_dev" ]]; then
+    read -rp "Dev server command (leave empty for none): " input_dev
+  else
+    read -rp "Dev server command (leave empty for none) [$default_dev]: " input_dev
+    input_dev="${input_dev:-$default_dev}"
+  fi
+
+  {
+    echo "REPO=\"$input_repo\""
+    echo "SESSION=\"$input_session\""
+    [[ -n "$input_worktrees" ]] && echo "WORKTREE_BASE=\"$input_worktrees\""
+    [[ -n "$input_dev" ]] && echo "DEV_CMD=\"$input_dev\""
+  } > "$proj_file"
+
+  echo ""
+  echo "Saved: $proj_file"
+  cat "$proj_file"
+}
+
+# --- Usage ---
 usage() {
   echo "Usage:"
   echo "  wf-workspace [name] [options]"
   echo "  wf-workspace close [name] [--force]"
+  echo "  wf-workspace setup [project-name]"
+  echo "  wf-workspace projects"
   echo ""
   echo "Create mode:"
-  echo "  Creates a git worktree and adds it as a tab in the 'wefunder' tmux session."
+  echo "  Creates a git worktree and adds it as a tab in a tmux session."
   echo "  Each tab has: claude (left 70%), tig status (top-right), dev server (bottom-right)"
   echo "  Tab colors indicate Claude's state: green=working, yellow=done, red=needs approval"
   echo ""
   echo "Close mode:"
-  echo "  Stops the worktree dev server, removes the git worktree, and closes the tmux tab."
+  echo "  Stops the dev server, removes the git worktree, and closes the tmux tab."
   echo ""
   echo "Arguments:"
-  echo "  name          Branch suffix (creates ${BRANCH_PREFIX}/<name>). Default: auto-generated in create mode"
+  echo "  name          Branch suffix (creates ${BRANCH_PREFIX}/<name>). Default: auto-generated"
   echo ""
   echo "Options:"
+  echo "  -p, --project NAME  Project to use (default: auto-detect from CWD, or ${DEFAULT_PROJECT:-wefunder})"
   echo "  -b, --base BRANCH   Base branch to create worktree from (default: master)"
   echo "  -e, --existing      Use existing worktree (don't create new)"
   echo "  -f, --force         Force removal in close mode (allows dirty worktree removal)"
@@ -123,25 +294,28 @@ usage() {
   echo "  -h, --help          Show this help"
   echo ""
   echo "Examples:"
-  echo "  wf-workspace fix-login        # New tab: ${BRANCH_PREFIX}/fix-login"
-  echo "  wf-workspace                  # New tab: ${BRANCH_PREFIX}/workspace-<timestamp>"
-  echo "  wf-workspace -e fix-login     # Tab for existing worktree"
-  echo "  wf-workspace close fix-login  # Stop server, remove worktree, close tmux tab"
-  echo "  wf-workspace close            # Close current tmux tab/worktree"
+  echo "  wf-workspace fix-login                   # New worktree tab (default project)"
+  echo "  wf-workspace -p wf-workspace tweak-ui    # Tab for a different project"
+  echo "  wf-workspace -e fix-login                # Tab for existing worktree"
+  echo "  wf-workspace close fix-login             # Close workspace and clean up"
+  echo "  wf-workspace setup my-project            # Add/edit a project"
+  echo "  wf-workspace projects                    # List configured projects"
 }
 
+# --- Resolve current workspace name (for close) ---
 resolve_current_workspace_name() {
+  local session="$1"
   local inferred_name=""
 
-  if [[ -n "${TMUX:-}" ]] && tmux has-session -t "$SESSION" 2>/dev/null; then
+  if [[ -n "${TMUX:-}" ]] && tmux has-session -t "$session" 2>/dev/null; then
     local current_session
     current_session="$(tmux display-message -p '#S' 2>/dev/null || true)"
-    if [[ "$current_session" == "$SESSION" ]]; then
+    if [[ "$current_session" == "$session" ]]; then
       inferred_name="$(tmux display-message -p '#W' 2>/dev/null || true)"
     fi
   fi
 
-  if [[ -z "$inferred_name" && "$PWD" == "$WORKTREE_BASE/"* ]]; then
+  if [[ -z "$inferred_name" && -n "${WORKTREE_BASE:-}" && "$PWD" == "$WORKTREE_BASE/"* ]]; then
     local relative_path
     relative_path="${PWD#"$WORKTREE_BASE/"}"
     inferred_name="${relative_path%%/*}"
@@ -150,6 +324,7 @@ resolve_current_workspace_name() {
   echo "$inferred_name"
 }
 
+# --- Close workspace ---
 close_workspace() {
   local requested_name="$1"
   local force_remove="$2"
@@ -157,7 +332,7 @@ close_workspace() {
 
   local name="$requested_name"
   if [[ -z "$name" ]]; then
-    name="$(resolve_current_workspace_name)"
+    name="$(resolve_current_workspace_name "$SESSION")"
   fi
 
   if [[ -z "$name" ]]; then
@@ -165,8 +340,6 @@ close_workspace() {
     echo "Run: wf-workspace close <name>"
     exit 1
   fi
-
-  local worktree_dir="$WORKTREE_BASE/$name"
 
   if [[ "$interactive" == true ]]; then
     echo ""
@@ -179,47 +352,52 @@ close_workspace() {
   fi
 
   echo "Closing workspace: $name"
-  echo "  Worktree: $worktree_dir"
 
-  if [[ -d "$worktree_dir" ]]; then
-    if [[ "$force_remove" != true ]]; then
-      local git_status
-      git_status="$(git -C "$worktree_dir" status --porcelain 2>/dev/null || true)"
-      if [[ -n "$git_status" ]]; then
-        if [[ "$interactive" == true ]]; then
-          echo ""
-          echo "⚠️  Worktree has uncommitted changes:"
-          git -C "$worktree_dir" status --short 2>/dev/null || true
-          echo ""
-          read -rp "Force close anyway? [y/N]: " force_choice
-          if [[ "$force_choice" =~ ^[Yy] ]]; then
-            force_remove=true
+  # Clean up worktree if this project uses them
+  if [[ -n "${WORKTREE_BASE:-}" ]]; then
+    local worktree_dir="$WORKTREE_BASE/$name"
+    echo "  Worktree: $worktree_dir"
+
+    if [[ -d "$worktree_dir" ]]; then
+      if [[ "$force_remove" != true ]]; then
+        local git_status
+        git_status="$(git -C "$worktree_dir" status --porcelain 2>/dev/null || true)"
+        if [[ -n "$git_status" ]]; then
+          if [[ "$interactive" == true ]]; then
+            echo ""
+            echo "⚠️  Worktree has uncommitted changes:"
+            git -C "$worktree_dir" status --short 2>/dev/null || true
+            echo ""
+            read -rp "Force close anyway? [y/N]: " force_choice
+            if [[ "$force_choice" =~ ^[Yy] ]]; then
+              force_remove=true
+            else
+              echo "Workspace kept. Run: wf-workspace close $name"
+              return 1
+            fi
           else
-            echo "Workspace kept. Run: wf-workspace close $name"
-            return 1
+            echo ""
+            echo "Refusing to remove dirty worktree: $worktree_dir"
+            echo "Commit/stash changes first, or rerun with:"
+            echo "  wf-workspace close --force $name"
+            exit 1
           fi
-        else
-          echo ""
-          echo "Refusing to remove dirty worktree: $worktree_dir"
-          echo "Commit/stash changes first, or rerun with:"
-          echo "  wf-workspace close --force $name"
-          exit 1
         fi
       fi
-    fi
 
-    if [[ -x "$worktree_dir/bin/dev-worktree" ]]; then
-      (cd "$worktree_dir" && bin/dev-worktree stop > /dev/null 2>&1 || true)
-    fi
+      if [[ -n "${DEV_CMD:-}" && -x "$worktree_dir/bin/dev-worktree" ]]; then
+        (cd "$worktree_dir" && bin/dev-worktree stop > /dev/null 2>&1 || true)
+      fi
 
-    if [[ "$force_remove" == true ]]; then
-      git -C "$MAIN_REPO" worktree remove --force "$worktree_dir"
+      if [[ "$force_remove" == true ]]; then
+        git -C "$REPO" worktree remove --force "$worktree_dir"
+      else
+        git -C "$REPO" worktree remove "$worktree_dir"
+      fi
+      echo "✓ Removed git worktree"
     else
-      git -C "$MAIN_REPO" worktree remove "$worktree_dir"
+      echo "⚠️  Worktree directory not found, skipping git worktree removal"
     fi
-    echo "✓ Removed git worktree"
-  else
-    echo "⚠️  Worktree directory not found, skipping git worktree removal"
   fi
 
   if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -232,13 +410,33 @@ close_workspace() {
   fi
 }
 
-# Parse command
+# --- Parse top-level command ---
 COMMAND="create"
+PROJECT_OVERRIDE=""
+
 if [[ $# -gt 0 ]]; then
   case "$1" in
     close)
       COMMAND="close"
       shift
+      ;;
+    setup)
+      COMMAND="setup"
+      shift
+      ;;
+    projects)
+      echo "Configured projects:"
+      for proj_file in "$PROJECTS_DIR"/*; do
+        [[ -f "$proj_file" ]] || continue
+        proj_name="$(basename "$proj_file")"
+        proj_repo="$(grep '^REPO=' "$proj_file" | head -1 | cut -d'"' -f2)"
+        marker=""
+        if [[ "$proj_name" == "${DEFAULT_PROJECT:-}" ]]; then
+          marker=" (default)"
+        fi
+        echo "  $proj_name$marker  →  $proj_repo"
+      done
+      exit 0
       ;;
     -h|--help)
       usage
@@ -247,54 +445,39 @@ if [[ $# -gt 0 ]]; then
   esac
 fi
 
-if [[ "$COMMAND" == "close" ]]; then
-  NAME=""
-  FORCE_REMOVE=false
-  INTERACTIVE=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -f|--force)
-        FORCE_REMOVE=true
-        shift
-        ;;
-      -i|--interactive)
-        INTERACTIVE=true
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -*)
-        echo "Unknown option: $1"
-        usage
-        exit 1
-        ;;
-      *)
-        NAME="$1"
-        shift
-        ;;
-    esac
-  done
-
-  close_workspace "$NAME" "$FORCE_REMOVE" "$INTERACTIVE"
+# Handle setup before loading project
+if [[ "$COMMAND" == "setup" ]]; then
+  run_setup "$@"
   exit 0
 fi
 
-# Parse create-mode arguments
+# --- Parse remaining flags (shared between create and close) ---
+NAME=""
 BASE_BRANCH="master"
 EXISTING=false
-NAME=""
+FORCE_REMOVE=false
+INTERACTIVE=false
 
 while [[ $# -gt 0 ]]; do
-  case $1 in
+  case "$1" in
+    -p|--project)
+      PROJECT_OVERRIDE="$2"
+      shift 2
+      ;;
     -b|--base)
       BASE_BRANCH="$2"
       shift 2
       ;;
     -e|--existing)
       EXISTING=true
+      shift
+      ;;
+    -f|--force)
+      FORCE_REMOVE=true
+      shift
+      ;;
+    -i|--interactive)
+      INTERACTIVE=true
       shift
       ;;
     -h|--help)
@@ -313,44 +496,67 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Generate name if not provided
+# --- Resolve and load project ---
+if [[ -n "$PROJECT_OVERRIDE" ]]; then
+  ACTIVE_PROJECT="$PROJECT_OVERRIDE"
+elif ACTIVE_PROJECT="$(detect_project_from_cwd)"; then
+  true
+else
+  ACTIVE_PROJECT="${DEFAULT_PROJECT:-wefunder}"
+fi
+
+load_project "$ACTIVE_PROJECT"
+
+# --- Close mode ---
+if [[ "$COMMAND" == "close" ]]; then
+  close_workspace "$NAME" "$FORCE_REMOVE" "$INTERACTIVE"
+  exit 0
+fi
+
+# --- Create mode ---
 if [[ -z "$NAME" ]]; then
   NAME="workspace-$(date +%m%d-%H%M)"
 fi
 
-BRANCH="${BRANCH_PREFIX}/$NAME"
-WORKTREE_DIR="$WORKTREE_BASE/$NAME"
+# Determine working directory
+if [[ -n "${WORKTREE_BASE:-}" ]]; then
+  # Worktree-based project
+  BRANCH="${BRANCH_PREFIX}/$NAME"
+  WORK_DIR="$WORKTREE_BASE/$NAME"
 
-# --- Worktree setup ---
-if [[ "$EXISTING" == true ]]; then
-  if [[ ! -d "$WORKTREE_DIR" ]]; then
-    echo "Error: Worktree not found at $WORKTREE_DIR"
-    echo ""
-    echo "Existing worktrees:"
-    git -C "$MAIN_REPO" worktree list
-    exit 1
-  fi
-else
-  mkdir -p "$WORKTREE_BASE"
-
-  if [[ -d "$WORKTREE_DIR" ]]; then
-    echo "Worktree already exists at $WORKTREE_DIR, reusing it."
-  else
-    echo "Creating worktree: $WORKTREE_DIR (branch: $BRANCH)"
-    cd "$MAIN_REPO"
-    git fetch origin "$BASE_BRANCH" --quiet 2>/dev/null || true
-
-    if git worktree add "$WORKTREE_DIR" -b "$BRANCH" "origin/$BASE_BRANCH" 2>/dev/null; then
-      echo "Created new branch: $BRANCH"
-    elif git worktree add "$WORKTREE_DIR" "$BRANCH" 2>/dev/null; then
-      echo "Using existing branch: $BRANCH"
-    else
-      echo "Error: Failed to create worktree."
-      echo "Check if branch '$BRANCH' already exists with a different worktree."
-      git worktree list
+  if [[ "$EXISTING" == true ]]; then
+    if [[ ! -d "$WORK_DIR" ]]; then
+      echo "Error: Worktree not found at $WORK_DIR"
+      echo ""
+      echo "Existing worktrees:"
+      git -C "$REPO" worktree list
       exit 1
     fi
+  else
+    mkdir -p "$WORKTREE_BASE"
+
+    if [[ -d "$WORK_DIR" ]]; then
+      echo "Worktree already exists at $WORK_DIR, reusing it."
+    else
+      echo "Creating worktree: $WORK_DIR (branch: $BRANCH)"
+      cd "$REPO"
+      git fetch origin "$BASE_BRANCH" --quiet 2>/dev/null || true
+
+      if git worktree add "$WORK_DIR" -b "$BRANCH" "origin/$BASE_BRANCH" 2>/dev/null; then
+        echo "Created new branch: $BRANCH"
+      elif git worktree add "$WORK_DIR" "$BRANCH" 2>/dev/null; then
+        echo "Using existing branch: $BRANCH"
+      else
+        echo "Error: Failed to create worktree."
+        echo "Check if branch '$BRANCH' already exists with a different worktree."
+        git worktree list
+        exit 1
+      fi
+    fi
   fi
+else
+  # Direct repo project (no worktrees)
+  WORK_DIR="$REPO"
 fi
 
 # --- tmux setup ---
@@ -359,23 +565,24 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   SESSION_EXISTS=true
 fi
 
-# Check if a window with this name already exists
 if [[ "$SESSION_EXISTS" == true ]] && tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$NAME"; then
   echo "Tab '$NAME' already exists. Switching to it..."
   tmux select-window -t "$SESSION:$NAME"
   exec tmux attach -t "$SESSION"
 fi
 
-setup_window_panes() {
+setup_panes() {
   local target="$1"
 
-  # Split right side for tig (pane 1 = top-right)
-  tmux split-window -h -t "$target" -c "$WORKTREE_DIR" \
+  # Always add tig
+  tmux split-window -h -t "$target" -c "$WORK_DIR" \
     "while true; do tig status; sleep 0.2; done"
 
-  # Split right pane for dev server (pane 2 = bottom-right)
-  tmux split-window -v -t "${target}.1" -c "$WORKTREE_DIR" \
-    "bin/dev-worktree start; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+  # Add dev server pane if DEV_CMD is set
+  if [[ -n "${DEV_CMD:-}" ]]; then
+    tmux split-window -v -t "${target}.1" -c "$WORK_DIR" \
+      "$DEV_CMD; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+  fi
 
   # Claude gets 70% width
   tmux resize-pane -t "${target}.0" -x "70%"
@@ -395,26 +602,34 @@ else
 fi
 
 echo ""
+echo "  Project: $ACTIVE_PROJECT"
 echo "  Tab: $NAME"
-echo "  Worktree: $WORKTREE_DIR"
+echo "  Directory: $WORK_DIR"
 echo "  Left:         $CLI_LABEL (70%)"
 echo "  Top-right:    tig status (30%)"
-echo "  Bottom-right: dev server (30%)"
+if [[ -n "${DEV_CMD:-}" ]]; then
+  echo "  Bottom-right: dev server (30%)"
+fi
 echo ""
 
-if [[ "$SESSION_EXISTS" == true ]]; then
-  # Add a new window (tab) to existing session
-  tmux new-window -t "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
-    "$CLI_CMD; ~/bin/wf-workspace close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+# Build the on-exit command: close worktree if applicable, otherwise just prompt
+if [[ -n "${WORKTREE_BASE:-}" ]]; then
+  ON_EXIT="~/bin/wf-workspace -p $ACTIVE_PROJECT close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+else
+  ON_EXIT="echo 'Press Enter to close pane.'; read"
+fi
 
-  setup_window_panes "$SESSION:$NAME"
+if [[ "$SESSION_EXISTS" == true ]]; then
+  tmux new-window -t "$SESSION" -n "$NAME" -c "$WORK_DIR" \
+    "$CLI_CMD; $ON_EXIT"
+
+  setup_panes "$SESSION:$NAME"
   tmux select-window -t "$SESSION:$NAME"
 else
-  # Create new session with first window
-  tmux new-session -d -s "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
-    "$CLI_CMD; ~/bin/wf-workspace close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+  tmux new-session -d -s "$SESSION" -n "$NAME" -c "$WORK_DIR" \
+    "$CLI_CMD; $ON_EXIT"
 
-  setup_window_panes "$SESSION:$NAME"
+  setup_panes "$SESSION:$NAME"
 fi
 
 # Start monitor if not already running
