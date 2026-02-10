@@ -1,0 +1,11 @@
+# wf-workspace configuration
+# Copy this to ~/.wf-workspace.conf and edit for your setup.
+
+# Path to the main wefunder repo
+MAIN_REPO="$HOME/code/wefunder"
+
+# Where worktrees are created
+WORKTREE_BASE="$HOME/code/worktrees"
+
+# Branch prefix (your name)
+BRANCH_PREFIX="yourname"

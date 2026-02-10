@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# wf-workspace-monitor
+#
+# Monitors Claude/agent state in tmux panes and updates tab colors.
+#   green  = actively working (streaming output)
+#   yellow = idle / waiting for user input
+#   red    = needs approval (permission prompt)
+#
+# Runs as a background daemon, started automatically by wf-workspace.
+# Kill with: pkill -f wf-workspace-monitor
+
+SESSION="wefunder"
+POLL_INTERVAL=2
+
+# Store previous pane content checksums to detect activity
+declare -A PREV_HASH
+
+while true; do
+  # Exit if session no longer exists
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    sleep 5
+    continue
+  fi
+
+  # Iterate over all windows in the session
+  for window in $(tmux list-windows -t "$SESSION" -F "#{window_index}" 2>/dev/null); do
+    # Capture last 10 lines of pane 0 (the Claude/agent pane)
+    content=$(tmux capture-pane -t "$SESSION:$window.0" -p -S -10 2>/dev/null || true)
+
+    if [[ -z "$content" ]]; then
+      continue
+    fi
+
+    # Determine state based on terminal content patterns
+    state="working"
+
+    # Check for approval/permission prompts (red)
+    # Claude Code shows "Allow" prompts, tool approval dialogs, y/n questions
+    if echo "$content" | grep -qiE '(Allow .+ tool|Do you want to proceed|Approve|allow this|press Enter to confirm|\(y\)|Yes.*No|Allow once|Allow always)'; then
+      state="approval"
+
+    # Check for idle/waiting for input (yellow)
+    # Claude Code shows a prompt character when waiting for user input
+    # Look for the input prompt at the end of output
+    elif echo "$content" | tail -3 | grep -qE '(^>\s*$|❯\s*$|^\$\s*$|^claude>\s*$|waiting for|Type a message|^Human:)'; then
+      state="idle"
+
+    else
+      # Check if content changed since last poll (activity detection)
+      current_hash=$(echo "$content" | md5 -q 2>/dev/null || echo "$content" | md5sum 2>/dev/null | cut -d' ' -f1)
+      prev_hash="${PREV_HASH[$window]:-}"
+
+      if [[ "$current_hash" == "$prev_hash" ]]; then
+        # Content hasn't changed - likely idle
+        state="idle"
+      fi
+
+      PREV_HASH[$window]="$current_hash"
+    fi
+
+    # Apply tab color based on state
+    case $state in
+      working)
+        tmux set-window-option -t "$SESSION:$window" window-status-style 'fg=green' 2>/dev/null
+        tmux set-window-option -t "$SESSION:$window" window-status-current-style 'fg=green,bold,underscore' 2>/dev/null
+        ;;
+      idle)
+        tmux set-window-option -t "$SESSION:$window" window-status-style 'fg=yellow' 2>/dev/null
+        tmux set-window-option -t "$SESSION:$window" window-status-current-style 'fg=yellow,bold,underscore' 2>/dev/null
+        ;;
+      approval)
+        tmux set-window-option -t "$SESSION:$window" window-status-style 'fg=red,bold' 2>/dev/null
+        tmux set-window-option -t "$SESSION:$window" window-status-current-style 'fg=red,bold,underscore' 2>/dev/null
+        ;;
+    esac
+  done
+
+  sleep "$POLL_INTERVAL"
+done

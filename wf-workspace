@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Load user config
+CONFIG_FILE="${HOME}/.wf-workspace.conf"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Error: Config file not found: $CONFIG_FILE"
+  echo ""
+  echo "Create it with:"
+  echo "  cat > $CONFIG_FILE << 'EOF'"
+  echo '  MAIN_REPO="$HOME/code/wefunder"'
+  echo '  WORKTREE_BASE="$HOME/code/worktrees"'
+  echo '  BRANCH_PREFIX="yourname"'
+  echo "  EOF"
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# Validate required config
+for var in MAIN_REPO WORKTREE_BASE BRANCH_PREFIX; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "Error: $var not set in $CONFIG_FILE"
+    exit 1
+  fi
+done
+
+SESSION="wefunder"
+
+usage() {
+  echo "Usage:"
+  echo "  wf-workspace [name] [options]"
+  echo "  wf-workspace close [name] [--force]"
+  echo ""
+  echo "Create mode:"
+  echo "  Creates a git worktree and adds it as a tab in the 'wefunder' tmux session."
+  echo "  Each tab has: claude (left 70%), tig status (top-right), dev server (bottom-right)"
+  echo "  Tab colors indicate Claude's state: green=working, yellow=done, red=needs approval"
+  echo ""
+  echo "Close mode:"
+  echo "  Stops the worktree dev server, removes the git worktree, and closes the tmux tab."
+  echo ""
+  echo "Arguments:"
+  echo "  name          Branch suffix (creates ${BRANCH_PREFIX}/<name>). Default: auto-generated in create mode"
+  echo ""
+  echo "Options:"
+  echo "  -b, --base BRANCH   Base branch to create worktree from (default: master)"
+  echo "  -e, --existing      Use existing worktree (don't create new)"
+  echo "  -f, --force         Force removal in close mode (allows dirty worktree removal)"
+  echo "  -i, --interactive   Prompt before closing (used automatically when Claude exits)"
+  echo "  -h, --help          Show this help"
+  echo ""
+  echo "Examples:"
+  echo "  wf-workspace fix-login        # New tab: ${BRANCH_PREFIX}/fix-login"
+  echo "  wf-workspace                  # New tab: ${BRANCH_PREFIX}/workspace-<timestamp>"
+  echo "  wf-workspace master           # New tab for main repo (no worktree)"
+  echo "  wf-workspace -e fix-login     # Tab for existing worktree"
+  echo "  wf-workspace close fix-login  # Stop server, remove worktree, close tmux tab"
+  echo "  wf-workspace close            # Close current tmux tab/worktree"
+}
+
+resolve_current_workspace_name() {
+  local inferred_name=""
+
+  if [[ -n "${TMUX:-}" ]] && tmux has-session -t "$SESSION" 2>/dev/null; then
+    local current_session
+    current_session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+    if [[ "$current_session" == "$SESSION" ]]; then
+      inferred_name="$(tmux display-message -p '#W' 2>/dev/null || true)"
+    fi
+  fi
+
+  if [[ -z "$inferred_name" && "$PWD" == "$WORKTREE_BASE/"* ]]; then
+    local relative_path
+    relative_path="${PWD#"$WORKTREE_BASE/"}"
+    inferred_name="${relative_path%%/*}"
+  fi
+
+  echo "$inferred_name"
+}
+
+close_workspace() {
+  local requested_name="$1"
+  local force_remove="$2"
+  local interactive="${3:-false}"
+
+  local name="$requested_name"
+  if [[ -z "$name" ]]; then
+    name="$(resolve_current_workspace_name)"
+  fi
+
+  if [[ -z "$name" ]]; then
+    echo "Error: Could not infer workspace name."
+    echo "Run: wf-workspace close <name>"
+    exit 1
+  fi
+
+  # Master tab has no worktree to clean up
+  if [[ "$name" == "master" ]]; then
+    echo "Closing master tab..."
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      if tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "master"; then
+        tmux kill-window -t "$SESSION:master" 2>/dev/null || true
+        echo "✓ Closed tmux tab: master"
+      else
+        echo "ℹ️  No tmux tab named 'master' in session '$SESSION'"
+      fi
+    fi
+    return 0
+  fi
+
+  local worktree_dir="$WORKTREE_BASE/$name"
+
+  if [[ "$interactive" == true ]]; then
+    echo ""
+    read -rp "Close workspace '$name'? [Y/n]: " choice
+    choice="${choice:-y}"
+    if [[ ! "$choice" =~ ^[Yy] ]]; then
+      echo "Workspace kept. Run: wf-workspace close $name"
+      return 1
+    fi
+  fi
+
+  echo "Closing workspace: $name"
+  echo "  Worktree: $worktree_dir"
+
+  if [[ -d "$worktree_dir" ]]; then
+    if [[ "$force_remove" != true ]]; then
+      local git_status
+      git_status="$(git -C "$worktree_dir" status --porcelain 2>/dev/null || true)"
+      if [[ -n "$git_status" ]]; then
+        if [[ "$interactive" == true ]]; then
+          echo ""
+          echo "⚠️  Worktree has uncommitted changes:"
+          git -C "$worktree_dir" status --short 2>/dev/null || true
+          echo ""
+          read -rp "Force close anyway? [y/N]: " force_choice
+          if [[ "$force_choice" =~ ^[Yy] ]]; then
+            force_remove=true
+          else
+            echo "Workspace kept. Run: wf-workspace close $name"
+            return 1
+          fi
+        else
+          echo ""
+          echo "Refusing to remove dirty worktree: $worktree_dir"
+          echo "Commit/stash changes first, or rerun with:"
+          echo "  wf-workspace close --force $name"
+          exit 1
+        fi
+      fi
+    fi
+
+    if [[ -x "$worktree_dir/bin/dev-worktree" ]]; then
+      (cd "$worktree_dir" && bin/dev-worktree stop > /dev/null 2>&1 || true)
+    fi
+
+    if [[ "$force_remove" == true ]]; then
+      git -C "$MAIN_REPO" worktree remove --force "$worktree_dir"
+    else
+      git -C "$MAIN_REPO" worktree remove "$worktree_dir"
+    fi
+    echo "✓ Removed git worktree"
+  else
+    echo "⚠️  Worktree directory not found, skipping git worktree removal"
+  fi
+
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    if tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$name"; then
+      tmux kill-window -t "$SESSION:$name" 2>/dev/null || true
+      echo "✓ Closed tmux tab: $name"
+    else
+      echo "ℹ️  No tmux tab named '$name' in session '$SESSION'"
+    fi
+  fi
+}
+
+# Parse command
+COMMAND="create"
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    close)
+      COMMAND="close"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+fi
+
+if [[ "$COMMAND" == "close" ]]; then
+  NAME=""
+  FORCE_REMOVE=false
+  INTERACTIVE=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force)
+        FORCE_REMOVE=true
+        shift
+        ;;
+      -i|--interactive)
+        INTERACTIVE=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        echo "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+      *)
+        NAME="$1"
+        shift
+        ;;
+    esac
+  done
+
+  close_workspace "$NAME" "$FORCE_REMOVE" "$INTERACTIVE"
+  exit 0
+fi
+
+# Parse create-mode arguments
+BASE_BRANCH="master"
+EXISTING=false
+NAME=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -b|--base)
+      BASE_BRANCH="$2"
+      shift 2
+      ;;
+    -e|--existing)
+      EXISTING=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    *)
+      NAME="$1"
+      shift
+      ;;
+  esac
+done
+
+# Generate name if not provided
+if [[ -z "$NAME" ]]; then
+  NAME="workspace-$(date +%m%d-%H%M)"
+fi
+
+# --- Master mode: open a tab pointing at the main repo ---
+if [[ "$NAME" == "master" ]]; then
+  WORK_DIR="$MAIN_REPO"
+
+  SESSION_EXISTS=false
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    SESSION_EXISTS=true
+  fi
+
+  if [[ "$SESSION_EXISTS" == true ]] && tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "master"; then
+    echo "Tab 'master' already exists. Switching to it..."
+    tmux select-window -t "$SESSION:master"
+    exec tmux attach -t "$SESSION"
+  fi
+
+  echo ""
+  read -rp "Which CLI do you want to open? ([claude]/agent): " CLI_CHOICE
+  CLI_CHOICE="${CLI_CHOICE:-claude}"
+
+  if [[ "$CLI_CHOICE" == "agent" ]]; then
+    CLI_CMD="agent"
+    CLI_LABEL="agent (Cursor)"
+  else
+    CLI_CMD="claude"
+    CLI_LABEL="claude"
+  fi
+
+  echo ""
+  echo "  Tab: master"
+  echo "  Directory: $WORK_DIR"
+  echo "  Left:         $CLI_LABEL (70%)"
+  echo "  Top-right:    tig status (30%)"
+  echo "  Bottom-right: dev server (30%)"
+  echo ""
+
+  setup_master_panes() {
+    local target="$1"
+
+    tmux split-window -h -t "$target" -c "$WORK_DIR" \
+      "while true; do tig status; sleep 0.2; done"
+
+    tmux split-window -v -t "${target}.1" -c "$WORK_DIR" \
+      "bin/dev; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+
+    tmux resize-pane -t "${target}.0" -x "70%"
+  }
+
+  if [[ "$SESSION_EXISTS" == true ]]; then
+    tmux new-window -t "$SESSION" -n "master" -c "$WORK_DIR" \
+      "$CLI_CMD; echo 'Press Enter to close pane.'; read"
+
+    setup_master_panes "$SESSION:master"
+    tmux select-window -t "$SESSION:master"
+  else
+    tmux new-session -d -s "$SESSION" -n "master" -c "$WORK_DIR" \
+      "$CLI_CMD; echo 'Press Enter to close pane.'; read"
+
+    setup_master_panes "$SESSION:master"
+  fi
+
+  if ! pgrep -f "wf-workspace-monitor" > /dev/null 2>&1; then
+    nohup ~/bin/wf-workspace-monitor > /dev/null 2>&1 &
+    disown
+  fi
+
+  exec tmux attach -t "$SESSION"
+fi
+
+# --- Worktree mode ---
+BRANCH="${BRANCH_PREFIX}/$NAME"
+WORKTREE_DIR="$WORKTREE_BASE/$NAME"
+
+if [[ "$EXISTING" == true ]]; then
+  if [[ ! -d "$WORKTREE_DIR" ]]; then
+    echo "Error: Worktree not found at $WORKTREE_DIR"
+    echo ""
+    echo "Existing worktrees:"
+    git -C "$MAIN_REPO" worktree list
+    exit 1
+  fi
+else
+  mkdir -p "$WORKTREE_BASE"
+
+  if [[ -d "$WORKTREE_DIR" ]]; then
+    echo "Worktree already exists at $WORKTREE_DIR, reusing it."
+  else
+    echo "Creating worktree: $WORKTREE_DIR (branch: $BRANCH)"
+    cd "$MAIN_REPO"
+    git fetch origin "$BASE_BRANCH" --quiet 2>/dev/null || true
+
+    if git worktree add "$WORKTREE_DIR" -b "$BRANCH" "origin/$BASE_BRANCH" 2>/dev/null; then
+      echo "Created new branch: $BRANCH"
+    elif git worktree add "$WORKTREE_DIR" "$BRANCH" 2>/dev/null; then
+      echo "Using existing branch: $BRANCH"
+    else
+      echo "Error: Failed to create worktree."
+      echo "Check if branch '$BRANCH' already exists with a different worktree."
+      git worktree list
+      exit 1
+    fi
+  fi
+fi
+
+# --- tmux setup ---
+SESSION_EXISTS=false
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  SESSION_EXISTS=true
+fi
+
+# Check if a window with this name already exists
+if [[ "$SESSION_EXISTS" == true ]] && tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$NAME"; then
+  echo "Tab '$NAME' already exists. Switching to it..."
+  tmux select-window -t "$SESSION:$NAME"
+  exec tmux attach -t "$SESSION"
+fi
+
+setup_window_panes() {
+  local target="$1"
+
+  # Split right side for tig (pane 1 = top-right)
+  tmux split-window -h -t "$target" -c "$WORKTREE_DIR" \
+    "while true; do tig status; sleep 0.2; done"
+
+  # Split right pane for dev server (pane 2 = bottom-right)
+  tmux split-window -v -t "${target}.1" -c "$WORKTREE_DIR" \
+    "bin/dev-worktree start; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+
+  # Claude gets 70% width
+  tmux resize-pane -t "${target}.0" -x "70%"
+}
+
+# Ask which CLI to open
+echo ""
+read -rp "Which CLI do you want to open? ([claude]/agent): " CLI_CHOICE
+CLI_CHOICE="${CLI_CHOICE:-claude}"
+
+if [[ "$CLI_CHOICE" == "agent" ]]; then
+  CLI_CMD="agent"
+  CLI_LABEL="agent (Cursor)"
+else
+  CLI_CMD="claude"
+  CLI_LABEL="claude"
+fi
+
+echo ""
+echo "  Tab: $NAME"
+echo "  Worktree: $WORKTREE_DIR"
+echo "  Left:         $CLI_LABEL (70%)"
+echo "  Top-right:    tig status (30%)"
+echo "  Bottom-right: dev server (30%)"
+echo ""
+
+if [[ "$SESSION_EXISTS" == true ]]; then
+  # Add a new window (tab) to existing session
+  tmux new-window -t "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
+    "$CLI_CMD; ~/bin/wf-workspace close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+
+  setup_window_panes "$SESSION:$NAME"
+  tmux select-window -t "$SESSION:$NAME"
+else
+  # Create new session with first window
+  tmux new-session -d -s "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
+    "$CLI_CMD; ~/bin/wf-workspace close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+
+  setup_window_panes "$SESSION:$NAME"
+fi
+
+# Start monitor if not already running
+if ! pgrep -f "wf-workspace-monitor" > /dev/null 2>&1; then
+  nohup ~/bin/wf-workspace-monitor > /dev/null 2>&1 &
+  disown
+fi
+
+exec tmux attach -t "$SESSION"
