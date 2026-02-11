@@ -15,37 +15,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "(Press Enter to accept defaults shown in brackets)"
   echo ""
 
-  default_repo=""
-  if [[ -d "$PWD/.git" ]]; then
-    default_repo="$PWD"
-  else
-    for candidate in "$HOME/code/wefunder" "$HOME/wefunder"; do
-      if [[ -d "$candidate/.git" ]]; then
-        default_repo="$candidate"
-        break
-      fi
-    done
-  fi
-
-  if [[ -n "$default_repo" ]]; then
-    read -rp "Main repo path [$default_repo]: " input_repo
-    input_repo="${input_repo:-$default_repo}"
-  else
-    read -rp "Main repo path: " input_repo
-  fi
-  if [[ ! -d "$input_repo/.git" ]]; then
-    echo "Error: $input_repo doesn't look like a git repo"
-    exit 1
-  fi
-
-  default_worktrees="${input_repo}-worktrees"
-  read -rp "Worktree base directory [$default_worktrees]: " input_worktrees
-  input_worktrees="${input_worktrees:-$default_worktrees}"
-
-  default_session="$(basename "$input_repo")"
-  read -rp "tmux session name [$default_session]: " input_session
-  input_session="${input_session:-$default_session}"
-
   default_prefix="$(git config user.name 2>/dev/null | awk '{print tolower($1)}' || true)"
   if [[ -z "$default_prefix" ]]; then
     default_prefix="$(whoami)"
@@ -55,9 +24,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 
   mkdir -p "$(dirname "$CONFIG_FILE")"
   cat > "$CONFIG_FILE" << EOF
-MAIN_REPO="$input_repo"
-WORKTREE_BASE="$input_worktrees"
-SESSION="$input_session"
 BRANCH_PREFIX="$input_prefix"
 EOF
 
@@ -96,12 +62,29 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-for var in MAIN_REPO WORKTREE_BASE SESSION BRANCH_PREFIX; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "Error: $var not set in $CONFIG_FILE"
-    exit 1
+if [[ -z "${BRANCH_PREFIX:-}" ]]; then
+  echo "Error: BRANCH_PREFIX not set in $CONFIG_FILE"
+  exit 1
+fi
+
+# --- Repo detection ---
+detect_repo() {
+  local dir="${1:-$PWD}"
+  local git_dir
+  git_dir="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [[ -n "$git_dir" ]]; then
+    # git-common-dir returns <repo>/.git — go up one level
+    dirname "$git_dir"
+    return 0
   fi
-done
+  return 1
+}
+
+# Derive all settings from repo path
+setup_repo_vars() {
+  WORKTREE_BASE="${MAIN_REPO}-worktrees"
+  SESSION="$(basename "$MAIN_REPO")"
+}
 
 usage() {
   echo "Usage:"
@@ -109,7 +92,7 @@ usage() {
   echo "  wf-workspace close [name] [--force]"
   echo ""
   echo "Create mode:"
-  echo "  Creates a git worktree and adds it as a tab in the '$SESSION' tmux session."
+  echo "  Creates a git worktree and adds it as a tab in a tmux session."
   echo "  Each tab has: claude (left 70%), tig status (top-right), dev server (bottom-right)"
   echo "  Tab colors indicate Claude's state: green=working, yellow=done, red=needs approval"
   echo "  tmux shortcuts: Prefix + N creates a workspace, Prefix + X closes current workspace"
@@ -121,14 +104,15 @@ usage() {
   echo "  name          Branch suffix (creates ${BRANCH_PREFIX}/<name>). Default: auto-generated in create mode"
   echo ""
   echo "Options:"
-  echo "  -b, --base BRANCH   Base branch to create worktree from (default: master)"
+  echo "  -r, --repo PATH     Repo to use (default: auto-detect from CWD)"
+  echo "  -b, --base BRANCH   Base branch to create worktree from (default: auto-detect)"
   echo "  -e, --existing      Use existing worktree (don't create new)"
   echo "  -f, --force         Force removal in close mode (allows dirty worktree removal)"
   echo "  -i, --interactive   Prompt before closing (used automatically when Claude exits)"
   echo "  -h, --help          Show this help"
   echo ""
   echo "Examples:"
-  echo "  wf-workspace fix-login        # New tab: ${BRANCH_PREFIX}/fix-login"
+  echo "  wf-workspace fix-login        # New tab in repo detected from CWD"
   echo "  wf-workspace                  # New tab: ${BRANCH_PREFIX}/workspace-<timestamp>"
   echo "  wf-workspace -e fix-login     # Tab for existing worktree"
   echo "  wf-workspace close fix-login  # Stop server, remove worktree, close tmux tab"
@@ -241,6 +225,7 @@ close_workspace() {
 
 # Parse command
 COMMAND="create"
+REPO_OVERRIDE=""
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
@@ -262,6 +247,10 @@ if [[ "$COMMAND" == "close" ]]; then
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      -r|--repo)
+        REPO_OVERRIDE="$2"
+        shift 2
+        ;;
       -f|--force)
         FORCE_REMOVE=true
         shift
@@ -286,6 +275,15 @@ if [[ "$COMMAND" == "close" ]]; then
     esac
   done
 
+  # Resolve repo
+  if [[ -n "$REPO_OVERRIDE" ]]; then
+    MAIN_REPO="$REPO_OVERRIDE"
+  elif ! MAIN_REPO="$(detect_repo)"; then
+    echo "Error: Not in a git repo. Use -r to specify."
+    exit 1
+  fi
+  setup_repo_vars
+
   close_workspace "$NAME" "$FORCE_REMOVE" "$INTERACTIVE"
   exit 0
 fi
@@ -297,6 +295,10 @@ NAME=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
+    -r|--repo)
+      REPO_OVERRIDE="$2"
+      shift 2
+      ;;
     -b|--base)
       BASE_BRANCH="$2"
       shift 2
@@ -320,6 +322,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Resolve repo
+if [[ -n "$REPO_OVERRIDE" ]]; then
+  MAIN_REPO="$REPO_OVERRIDE"
+elif ! MAIN_REPO="$(detect_repo)"; then
+  echo "Error: Not in a git repo. Use -r to specify."
+  exit 1
+fi
+setup_repo_vars
 
 # Generate name if not provided
 if [[ -z "$NAME" ]]; then
@@ -430,9 +441,11 @@ setup_window_panes() {
   tmux split-window -h -t "$target" -c "$WORKTREE_DIR" \
     "tig status"
 
-  # Split right pane for dev server (pane 2 = bottom-right)
-  tmux split-window -v -t "${target}.1" -c "$WORKTREE_DIR" \
-    "bin/dev-worktree start; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+  # Split right pane for dev server if available (pane 2 = bottom-right)
+  if [[ -x "$WORKTREE_DIR/bin/dev-worktree" ]]; then
+    tmux split-window -v -t "${target}.1" -c "$WORKTREE_DIR" \
+      "bin/dev-worktree start; echo ''; echo 'Dev server stopped. Press Enter to close.'; read"
+  fi
 
   # Claude gets 70% width
   tmux resize-pane -t "${target}.0" -x "70%"
@@ -452,23 +465,26 @@ else
 fi
 
 echo ""
+echo "  Repo: $MAIN_REPO"
 echo "  Tab: $NAME"
 echo "  Worktree: $WORKTREE_DIR"
 echo "  Left:         $CLI_LABEL (70%)"
 echo "  Top-right:    tig status (30%, press q to close pane)"
-echo "  Bottom-right: dev server (30%)"
+if [[ -x "$WORKTREE_DIR/bin/dev-worktree" || ! -d "$WORKTREE_DIR" ]]; then
+  echo "  Bottom-right: dev server (30%)"
+fi
 echo "  Shortcuts:    Prefix + N new workspace, Prefix + X close workspace"
 echo ""
 
 if [[ "$SESSION_EXISTS" == true ]]; then
   tmux new-window -t "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
-    "$CLI_CMD; $SCRIPT_PATH close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+    "$CLI_CMD; $SCRIPT_PATH close -r $MAIN_REPO --interactive $NAME; echo 'Press Enter to close pane.'; read"
 
   setup_window_panes "$SESSION:$NAME"
   tmux select-window -t "$SESSION:$NAME"
 else
   tmux new-session -d -s "$SESSION" -n "$NAME" -c "$WORKTREE_DIR" \
-    "$CLI_CMD; $SCRIPT_PATH close --interactive $NAME; echo 'Press Enter to close pane.'; read"
+    "$CLI_CMD; $SCRIPT_PATH close -r $MAIN_REPO --interactive $NAME; echo 'Press Enter to close pane.'; read"
 
   setup_window_panes "$SESSION:$NAME"
   configure_tmux_mouse_clipboard
